@@ -32,8 +32,8 @@ python tsp.py instancia.txt
 ## Estrutura
 ```
 ├── tsp.py
+├── 300_tsp.txt (instância de exemplo)
 ├── requirements.txt
-├── output/
 └── README.md
 ```
 
