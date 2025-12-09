@@ -45,13 +45,16 @@ CONFIG = {
 }
 
 # RASTREAMENTO DE PROGRESSO
+# Monitora a evolução da solução ao longo do tempo.
 class ProgressTracker:
     def __init__(self):
+        # Inicializa histórico e melhor comprimento.
         self.history = []
         self.best_length = float('inf')
         self.iteration = 0
         
     def update(self, length, stage=""):
+        # Registra nova medição e atualiza o melhor comprimento se necessário.
         self.iteration += 1
         if length < self.best_length:
             self.best_length = length
@@ -63,7 +66,7 @@ class ProgressTracker:
         })
         
     def get_gap_history(self, optimal_length):
-        # Calcula o histórico de gap de otimalidade
+        # Calcula histórico de gap de otimalidade em relação ao ótimo. 
         if not self.history or optimal_length is None or optimal_length == 0:
             return []
         
@@ -77,13 +80,15 @@ class ProgressTracker:
         return gaps
 
 # PARSER TSPLIB
+# Utilitário para ler arquivos de instâncias TSP.
 class TSPReader:
     @staticmethod
     def read(filepath):
+        # Lê arquivo, extrai nós, coordenadas, pesos e a seed.
         nodes = []
         coords = {}
         weights_flat = []
-        seed_value = None  # Inicializa a variável para capturar a seed
+        seed_value = None
         
         reading_coords = False
         reading_matrix = False
@@ -109,7 +114,6 @@ class TSPReader:
                 reading_matrix = True
                 continue
             elif line.startswith("Seed"):
-                # Captura o valor da seed
                 parts = line.split(':')
                 if len(parts) > 1:
                     seed_value = parts[1].strip()
@@ -151,21 +155,22 @@ class TSPReader:
         else:
             print("Aviso: Matriz incompleta. Usando distâncias euclidianas.")
             weight_type = "EUC_2D"
-            # Retorna seed_value também
             return nodes, coords, weight_type, None, seed_value
 
-        # Retorna seed_value
         return nodes, coords, "EXPLICIT", matrix, seed_value
 
 # CÁLCULO DE DISTÂNCIAS
+# Operações matemáticas de distância.
 class DistanceCalculator:
     @staticmethod
     def euclidean(p1, p2):
+        # Calcula distância Euclidiana 2D arredondada entre dois pontos.
         dx, dy = p1[0] - p2[0], p1[1] - p2[1]
         return int(round(math.hypot(dx, dy)))
 
     @staticmethod
     def build_matrix(nodes, coords, weight_type, explicit_weights=None):
+        # Constrói matriz de distâncias NxN (explícita ou calculada).
         if weight_type == "EXPLICIT" and explicit_weights:
             return explicit_weights
 
@@ -180,9 +185,11 @@ class DistanceCalculator:
         return matrix
 
 # CLUSTERIZAÇÃO
+# Divisão espacial do problema em subproblemas menores.
 class Clustering:
     @staticmethod
     def create_clusters(nodes, coords):
+        # Divide nós em clusters usando Quad-Tree ou divisão simples.
         valid = {n: c for n, c in coords.items()
                  if c[0] != float('inf') and c[1] != float('inf')}
 
@@ -224,11 +231,13 @@ class Clustering:
 
     @staticmethod
     def _simple_split(nodes):
+        # Fatia lista de nós sequencialmente (fallback).
         size = CONFIG['nodes_per_cluster']
         return [nodes[i:i+size] for i in range(0, len(nodes), size)]
 
     @staticmethod
     def find_border_nodes(cluster, coords, index_map):
+        # Encontra nós extremos do cluster para conexão eficiente.
         valid = [n for n in cluster if n in index_map and n in coords]
         if not valid:
             return cluster[0], cluster[0]
@@ -243,9 +252,11 @@ class Clustering:
         return start, end
 
 # CONSTRUÇÃO DE TOUR
+# Construção de rotas iniciais.
 class TourBuilder:
     @staticmethod
     def dijkstra_tree(cluster, start, dist_matrix, index_map):
+        # Gera árvore de caminhos mínimos aproximada via Dijkstra.
         if len(cluster) <= 1 or start not in index_map:
             return []
 
@@ -273,6 +284,7 @@ class TourBuilder:
 
     @staticmethod
     def dfs_tour(edges, start, dist_matrix, index_map):
+        # Converte árvore de arestas em rota linear via DFS.
         if not edges or start not in index_map:
             return []
 
@@ -301,6 +313,7 @@ class TourBuilder:
 
     @staticmethod
     def calculate_length(tour, dist_matrix, index_map):
+        # Calcula distância total de uma rota cíclica.
         if not tour or len(tour) < 2:
             return CONFIG['infinity']
 
@@ -313,9 +326,11 @@ class TourBuilder:
         return total
 
 # OTIMIZAÇÕES LOCAIS
+# Heurísticas de melhoria local.
 class LocalOptimizer:
     @staticmethod
     def two_opt(tour, dist_matrix, idx_map, tracker=None, label="2-opt"):
+        # Aplica heurística 2-opt para remover cruzamentos de arestas.
         if len(tour) < 4:
             return tour[:]
 
@@ -348,6 +363,7 @@ class LocalOptimizer:
 
     @staticmethod
     def tabu_search(tour, dist_matrix, idx_map, tracker, label="tabu"):
+        # Busca Tabu com lista de movimentos proibidos temporariamente.
         best = tour[:]
         best_len = TourBuilder.calculate_length(best, dist_matrix, idx_map)
         tabu_list = {}
@@ -403,9 +419,11 @@ class LocalOptimizer:
         return best
 
 # 3-OPT
+# Otimização 3-opt com processamento paralelo.
 class ThreeOpt:
     @staticmethod
     def _calculate_delta(tour, dist_matrix, idx_map, i, j, k):
+        # Calcula ganho de trocar 3 arestas (4 recombinações).
         try:
             A, B = tour[i-1], tour[i]
             C, D = tour[j-1], tour[j]
@@ -443,6 +461,7 @@ class ThreeOpt:
 
     @staticmethod
     def _apply_swap(tour, i, j, k, option):
+        # Aplica a troca 3-opt reordenando segmentos.
         segment1 = tour[:i]
         segment2 = tour[i:j]
         segment3 = tour[j:k]
@@ -462,6 +481,7 @@ class ThreeOpt:
 
     @staticmethod
     def _evaluate_triplet_chunk(args):
+        # Avalia lote de trincas em paralelo buscando melhoria.
         tour, dist_matrix, idx_map, triplets = args
         base_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
 
@@ -477,6 +497,7 @@ class ThreeOpt:
 
     @staticmethod
     def optimize(tour, dist_matrix, idx_map, tracker, label="3-opt"):
+        # Executa otimização 3-opt paralela em rodadas.
         best_tour = tour[:]
         best_length = TourBuilder.calculate_length(best_tour, dist_matrix, idx_map)
         n = len(best_tour)
@@ -524,9 +545,11 @@ class ThreeOpt:
         return best_tour
 
 # PERTURBAÇÕES
+# Aplica 'chutes' na solução para escapar de mínimos locais.
 class Perturbation:
     @staticmethod
     def perturb(tour, strategy, idx_map, high_cost_edges=None):
+        # Aplica Double-Bridge, Multi 2-opt ou Embaralhamento.
         perturbed = tour[:]
         n = len(tour)
         if n < 5:
@@ -560,6 +583,7 @@ class Perturbation:
 
     @staticmethod
     def evaluate_perturbation_worker(args):
+        # Worker paralelo: perturba e aplica 2-opt rápido.
         tour, dist_matrix, idx_map, coords, strategy, iteration, high_cost_edges = args
         try:
             perturbed = Perturbation.perturb(tour, strategy, idx_map, high_cost_edges)
@@ -572,6 +596,7 @@ class Perturbation:
 
     @staticmethod
     def apply_multiple(tour, dist_matrix, idx_map, coords, tracker, num_perturbations):
+        # Gera múltiplas perturbações (ILS) e escolhe a melhor.
         original_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
         best_tour = tour[:]
         best_len = original_len
@@ -600,9 +625,11 @@ class Perturbation:
         return best_tour
 
 # UTILITÁRIOS
+# Manipulação da estrutura da rota.
 class TourUtils:
     @staticmethod
     def remove_subtours(tour, dist_matrix, idx_map, coords):
+        # Reconecta componentes desconexos em um único ciclo.
         n = len(tour)
         if n <= 1:
             return tour
@@ -647,6 +674,7 @@ class TourUtils:
 
     @staticmethod
     def merge_tours(tour1, tour2, dist_matrix, idx_map):
+        # Funde duas rotas minimizando custo de inserção.
         if not tour1 or not tour2:
             return tour1 if tour1 else tour2 if tour2 else []
 
@@ -684,8 +712,8 @@ class TourUtils:
         return t1[:i+1] + t2_reordered + t1[i+1:] + [t1[0]]
 
 # VISUALIZAÇÃO
+# Plota o tour e o gráfico de convergência.
 def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_result.png"):
-    # Plota o resultado final com tour e gap de otimalidade
     fig = plt.figure(figsize=(16, 7))
     
     # Gráfico 1: Rota do TSP
