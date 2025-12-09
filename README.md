@@ -26,10 +26,14 @@ pip install -r requirements.txt
 python tsp.py instancia.txt
 ```
 
+## Exemplo de Saída
+![Visualização da rota TSP](./300_tsp_grafico.png)
+
 ## Estrutura
 ```
 ├── tsp.py
 ├── requirements.txt
+├── output/
 └── README.md
 ```
 
