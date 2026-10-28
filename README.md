@@ -9,7 +9,7 @@ Encontrar a rota mais curta que visita todas as cidades exatamente uma vez e ret
 ## Algoritmo
 1. Tour inicial por curva de Hilbert (O(n log n)).
 2. **Lin-Kernighan** (cadeia de flips 2-opt, profundidade até 30, largura 5/3/2/1…) com fila de cidades alteradas e **6 candidatos por cidade escolhidos por alpha-nearness** (subgradiente de Held-Karp + MST sobre o grafo dos 16 vizinhos mais próximos, como no LKH).
-3. **ILS**: perturbação double-bridge local, nova busca só nas pontas alteradas, desfeita por um log de reversões (custo proporcional ao que mudou, não a n). Aceita pioras com probabilidade `exp(-delta/T)` (T = 0,1 × aresta média, só até 20 mil nós) e guarda o melhor tour.
+3. **ILS**: perturbação double-bridge (troca de dois segmentos adjacentes; metade das vezes de até 50 cidades, metade de até n/3 ou 1000, só até 5000 nós), nova busca só nas pontas alteradas, desfeita por um log de reversões (custo proporcional ao que mudou, não a n). Aceita pioras com probabilidade `exp(-delta/T)` (T = 0,1 × aresta média, só até 20 mil nós) e guarda o melhor tour.
 4. **Paralelo**: um processo por núcleo; a cada 1/20 do tempo todos recomeçam do melhor tour encontrado, com seeds diferentes.
 
 Sem matriz de distâncias: o núcleo calcula EUC_2D das coordenadas (vizinhos por grade uniforme), então a memória é O(n). A matriz só é usada quando vem no arquivo (formato próprio de `gerador_tsp.py`).
@@ -57,9 +57,9 @@ Todos os núcleos (8 processos), 4 seeds por instância. Gap contra o ótimo TSP
 | eil51, berlin52, kroA100, eil101, ch150, kroA200, a280, pcb442 | 51–442 | 5 s | 0,00% | 0,00% | 0,00% | 4/4 cada |
 | rat783 | 783 | 30 s | 0,00% | 0,00% | 0,00% | 4/4 |
 | pr1002 | 1002 | 30 s | 0,00% | 0,00% | 0,00% | 4/4 |
-| pr2392 | 2392 | 30 s | 0,14% | 0,19% | 0,27% | 0/4 |
+| pr2392 | 2392 | 30 s | 0,01% | 0,08% | 0,16% | 0/4 |
 | 1000_tsp (aleatória) | 1000 | 30 s | 2279 | 2279,0 | 2279 | – |
-| 2000_tsp (aleatória) | 2000 | 30 s | 3195 | 3196,2 | 3197 | – |
+| 2000_tsp (aleatória) | 2000 | 30 s | 3194 | 3195,0 | 3198 | – |
 
 Instâncias grandes (uma execução, 30 s de ILS, 8 processos; o tempo de parede inclui leitura, preparo e a busca local inicial). Não há ótimo conhecido; o "vs. estimativa" usa a fórmula assintótica 0,7124·√(n·A) para pontos uniformes, que ignora o efeito de borda:
 
@@ -73,7 +73,11 @@ Instâncias grandes (uma execução, 30 s de ILS, 8 processos; o tempo de parede
 
 Acima de ~20 mil nós o ILS faz poucas iterações e a qualidade vem quase toda do Lin-Kernighan; o tour em array tem inversão O(n) no pior caso, o que vai pesar além de algumas centenas de milhares de nós.
 
-Evolução (pr2392, média): Python 2-opt + Or-opt 1,15%; núcleo C com 10 vizinhos 0,12%; alpha-nearness com matriz densa chegou a medir 0,01% em uma rodada, mas não consegui reproduzir após a reescrita sem matriz (atual: 0,19%). Versão original do projeto (clusters + Dijkstra + 3-opt + tabu): 200_tsp = 1052 em 11 s e 500_tsp = 1716 em 94 s.
+Sensibilidade em pr2392 (média de 4 seeds, 30 s): janela do kick 10 → 0,34%, 50 → 0,19%, 200 → 0,08%, 500 → 0,09%, n/3 (796) → 0,01%, mistura 50/n÷3 → 0,08%. Janelas pequenas só mexem no tour localmente e não corrigem a estrutura global da solução inicial; em instâncias aleatórias grandes (≥ 10 mil nós) a janela grande atrapalha (5× menos iterações), por isso só vale até 5000 nós.
+
+Uma medição anterior de pr2392 deu 0,01% com a versão que usava matriz densa. Reconstruí essa versão e ela reproduz (0,04%), mas o resultado depende do conjunto de candidatos: com o mesmo alpha denso, variar as iterações do subgradiente deu 0,44% (70 iterações), 0,06% (100) e 0,10% (130). Ou seja, aquele valor era um conjunto de candidatos favorável, não uma propriedade do algoritmo. Em outras palavras: **comparar sempre com várias seeds e mais de um ajuste, nunca uma rodada só**.
+
+Evolução (pr2392, média): Python 2-opt + Or-opt 1,15%; núcleo C com 10 vizinhos 0,12%; versão atual 0,08%. Versão original do projeto (clusters + Dijkstra + 3-opt + tabu): 200_tsp = 1052 em 11 s e 500_tsp = 1716 em 94 s.
 
 Testado e descartado: Or-opt dentro do LK (pr1002 0,21% vs 0,15% e pr2392 0,31% vs 0,28% sem ele, 16 seeds).
 

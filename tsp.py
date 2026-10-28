@@ -35,7 +35,7 @@ def _load_core():
                                           ctypes.c_long, ctypes.c_int, ip]
     core.tsp_solve.restype = ctypes.c_long
     core.tsp_solve.argtypes = [ctypes.c_int, vp, vp, ctypes.c_int, ip, ip, ctypes.c_double,
-                               ctypes.c_ulonglong, ctypes.c_int, ctypes.c_double, ctypes.c_int,
+                               ctypes.c_ulonglong, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
                                ctypes.POINTER(ctypes.c_long)]
     return core
 
@@ -49,6 +49,8 @@ CONFIG = {
     'alpha_iters': 100,     # iterações do subgradiente (Held-Karp)
     'time_limit': 30.0,     # segundos de ILS (sobrescrito pelo 2º argumento da CLI)
     'kick_window': 50,      # tamanho máximo dos segmentos trocados no double-bridge local
+    'kick_window_large': 1000,  # idem, nos kicks "grandes" (metade das iterações; limitado a n/3)
+    'large_kick_max_n': 5000,   # acima disso só há kicks pequenos
     'workers': mp.cpu_count(),  # processos paralelos que compartilham o melhor tour (1 = serial)
     'sync_chunks': 20,      # nº de rodadas de sincronização por execução
     'accept_temp': 0.1,     # temperatura do aceite do ILS, em fração da aresta média (0 = só não piora)
@@ -222,8 +224,10 @@ def _run_chunk(tour, seconds, seed, init):
     iters = ctypes.c_long(0)
     D = None if _D is None else _D.ctypes.data
     xy = _XY.ctypes.data if _D is None else None
+    # kicks grandes só em instâncias pequenas: em n grande o reparo das arestas longas custa caro
+    large = CONFIG['kick_window_large'] if len(tour) <= CONFIG['large_kick_max_n'] else CONFIG['kick_window']
     cur = CORE.tsp_solve(len(tour), D, xy, _NEIGH.shape[1], _NEIGH, tour, seconds, seed,
-                         CONFIG['kick_window'], CONFIG['accept_temp'], init, ctypes.byref(iters))
+                         CONFIG['kick_window'], large, CONFIG['accept_temp'], init, ctypes.byref(iters))
     return cur, tour, iters.value
 
 # BUSCA LOCAL
@@ -375,7 +379,7 @@ class Solver:
         tour = self.initial_tour()
         near = np.ascontiguousarray(cand[:, :CONFIG['neighbors']])
         ub = CORE.tsp_solve(self.n, D, xy, near.shape[1], near, tour, 0.0, 1,
-                            CONFIG['kick_window'], 0.0, 1, ctypes.byref(ctypes.c_long(0)))
+                            CONFIG['kick_window'], CONFIG['kick_window'], 0.0, 1, ctypes.byref(ctypes.c_long(0)))
         self.start_tour = tour
         out = np.zeros((self.n, k), dtype=np.int32)
         CORE.tsp_alpha_candidates(self.n, D, xy, cand.shape[1], cand, k, ub, CONFIG['alpha_iters'], out)

@@ -186,8 +186,8 @@ static double now(void) {
 // Exatamente um entre D (matriz) e xy (coordenadas) deve ser não nulo.
 // Retorna o comprimento final; *iters recebe o número de iterações do ILS.
 long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, int *tour,
-               double time_limit, unsigned long long seed, int kick_window, double temp,
-               int init, long *iters) {
+               double time_limit, unsigned long long seed, int kick_window, int kick_window_large,
+               double temp, int init, long *iters) {
     S s; memset(&s, 0, sizeof s);
     s.n = n; s.K = K; s.D = D; s.xy = xy; s.neigh = neigh; s.tour = tour;
     s.pos = malloc(n * sizeof(int)); s.queue = malloc(n * sizeof(int)); s.inq = calloc(n, 1);
@@ -202,7 +202,9 @@ long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, i
     }
 
     int w = kick_window < 1 ? 1 : kick_window;
+    int wl = kick_window_large < w ? w : kick_window_large;  // janela grande: rearranjos mais globais
     if (w > (n - 2) / 3) w = (n - 2) / 3;
+    if (wl > (n - 2) / 3) wl = (n - 2) / 3;
     long it = 0;
     int *best = NULL; long best_len = cur;
     if (n >= 8 && time_limit > 0) {
@@ -215,7 +217,7 @@ long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, i
         while (now() < deadline) {
             it++;
             s.jn = 0;
-            long delta = kick(&s, w);
+            long delta = kick(&s, (rnd(&s) & 1) ? w : wl);  // metade pequenos, metade grandes
             delta -= local_search(&s);
             int ok = delta <= 0 || (T > 0 && delta < -T * log((rnd(&s) >> 11) * (1.0 / 9007199254740992.0) + 1e-18));
             if (ok) {

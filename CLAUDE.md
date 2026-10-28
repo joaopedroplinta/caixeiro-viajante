@@ -25,7 +25,9 @@ TSP_CFG="workers=1,accept_temp=0.3" python benchmark.py ...  # sobrescreve CONFI
 - **Todo tour tem de ser permutação válida dos nós** (sem repetição, sem perda). Conferir após qualquer mudança em otimização.
 - Não recalcular o comprimento do tour inteiro dentro de laços de busca; usar delta. Nada O(n) por iteração do ILS: o desfazer usa o log de reversões.
 - Nada O(n²) em memória ou tempo no caminho de coordenadas (a matriz é só para instâncias com matriz explícita).
-- Mudança de heurística só entra com `benchmark.py` antes/depois (várias seeds, mesma instância). Uma seed só engana; ruído entre rodadas chega a ±0,1% em pr2392.
+- Mudança de heurística só entra com `benchmark.py` antes/depois (várias seeds, mesma instância). Uma seed só engana; ruído entre rodadas chega a ±0,1% em pr2392. O conjunto de candidatos (alpha) é o mesmo para todas as seeds de uma execução, então variar `alpha_iters` também conta como amostra.
+- Em instâncias clusterizadas (pr2392) `kick_window` é a alavanca principal; em n grande a janela grande é desligada (`large_kick_max_n`).
+- **Commitar antes de refatorar o núcleo**: já perdemos a versão de referência uma vez e foi preciso reconstruí-la.
 - `libtspcore.so` é gerada em runtime (`-march=native`), não versionar. `tsp_core.c` mais novo que o `.so` recompila sozinho.
 - Código só entra no README se existir no `tsp.py`.
 - Arquivos `*_solucao.txt` e `*_grafico.png` são saída gerada; só versionar os de exemplo já existentes.
