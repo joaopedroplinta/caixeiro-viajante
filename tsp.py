@@ -36,7 +36,7 @@ def _load_core():
     core.tsp_solve.restype = ctypes.c_long
     core.tsp_solve.argtypes = [ctypes.c_int, vp, vp, ctypes.c_int, ip, ip, ctypes.c_double,
                                ctypes.c_ulonglong, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
-                               ctypes.POINTER(ctypes.c_long)]
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_long)]
     return core
 
 CORE = _load_core()
@@ -50,6 +50,9 @@ CONFIG = {
     'time_limit': 30.0,     # segundos de ILS (sobrescrito pelo 2º argumento da CLI)
     'kick_window': 50,      # tamanho máximo dos segmentos trocados no double-bridge local
     'kick_window_large': 1000,  # idem, nos kicks "grandes" (metade das iterações; limitado a n/3)
+    'max_reversal': 1000,   # maior trecho que o LK inverte nas tentativas do ILS (e no 1º estágio da busca inicial)
+    'max_reversal_min_n': 12000,  # abaixo disso não há limite: a qualidade por iteração pesa mais que a velocidade
+    'segment_min_n': 20000,  # a partir daqui cada processo otimiza um trecho do tour (senão: todos no tour inteiro)
     'large_kick_max_n': 5000,   # acima disso só há kicks pequenos
     'workers': mp.cpu_count(),  # processos paralelos que compartilham o melhor tour (1 = serial)
     'sync_chunks': 20,      # nº de rodadas de sincronização por execução
@@ -214,6 +217,9 @@ class DistanceCalculator:
 
 _D = _XY = _NEIGH = None
 
+def _max_reversal(n):
+    return CONFIG['max_reversal'] if n > CONFIG['max_reversal_min_n'] else 0
+
 def _init_worker(D, xy, neigh):
     global _D, _XY, _NEIGH
     _D, _XY, _NEIGH = D, xy, neigh
@@ -227,8 +233,25 @@ def _run_chunk(tour, seconds, seed, init):
     # kicks grandes só em instâncias pequenas: em n grande o reparo das arestas longas custa caro
     large = CONFIG['kick_window_large'] if len(tour) <= CONFIG['large_kick_max_n'] else CONFIG['kick_window']
     cur = CORE.tsp_solve(len(tour), D, xy, _NEIGH.shape[1], _NEIGH, tour, seconds, seed,
-                         CONFIG['kick_window'], large, CONFIG['accept_temp'], init, ctypes.byref(iters))
+                         CONFIG['kick_window'], large, CONFIG['accept_temp'], init, _max_reversal(len(tour)),
+                         -1, -1, ctypes.byref(iters))
     return cur, tour, iters.value
+
+def _segment_job(args):
+    # ILS num trecho do tour como subproblema cíclico; a aresta de fechamento (m-1, 0) é fixa.
+    # Devolve o caminho 0 -> ... -> m-1 (índices locais) e o nº de iterações.
+    xy, nb, seconds, seed = args
+    m = len(xy)
+    tour = np.arange(m, dtype=np.int32)
+    large = CONFIG['kick_window_large'] if m <= CONFIG['large_kick_max_n'] else CONFIG['kick_window']
+    iters = ctypes.c_long(0)
+    CORE.tsp_solve(m, None, xy.ctypes.data, nb.shape[1], nb, tour, seconds, seed, CONFIG['kick_window'],
+                   large, CONFIG['accept_temp'], 0, _max_reversal(m), m - 1, 0, ctypes.byref(iters))
+    p = int(np.flatnonzero(tour == 0)[0])
+    path = np.roll(tour, -p)
+    if path[1] == m - 1:  # a aresta fixa vem logo depois do 0: percorre ao contrário
+        path = np.concatenate(([0], path[1:][::-1]))
+    return path, iters.value
 
 # BUSCA LOCAL
 # 2-opt + Or-opt com listas de vizinhos e fila de cidades "sujas" (don't-look bits).
@@ -379,7 +402,8 @@ class Solver:
         tour = self.initial_tour()
         near = np.ascontiguousarray(cand[:, :CONFIG['neighbors']])
         ub = CORE.tsp_solve(self.n, D, xy, near.shape[1], near, tour, 0.0, 1,
-                            CONFIG['kick_window'], CONFIG['kick_window'], 0.0, 1, ctypes.byref(ctypes.c_long(0)))
+                            CONFIG['kick_window'], CONFIG['kick_window'], 0.0, 1, _max_reversal(self.n),
+                            -1, -1, ctypes.byref(ctypes.c_long(0)))
         self.start_tour = tour
         out = np.zeros((self.n, k), dtype=np.int32)
         CORE.tsp_alpha_candidates(self.n, D, xy, cand.shape[1], cand, k, ub, CONFIG['alpha_iters'], out)
@@ -436,18 +460,54 @@ class Solver:
         pool = mp.get_context('fork').Pool(workers) if workers > 1 and 'fork' in mp.get_all_start_methods() else None
         total = 0
         try:
-            for _ in range(chunks):
-                jobs = [(tour, time_limit / chunks, self.rng.getrandbits(32), 0) for _ in range(workers)]
-                results = pool.starmap(_run_chunk, jobs) if pool else [_run_chunk(*jobs[0])]
-                cur, tour, _ = min(results, key=lambda r: r[0])
-                total += sum(r[2] for r in results)
-                if tracker:
-                    tracker.update(cur, "LK + ILS")
+            if pool and self.n >= CONFIG['segment_min_n']:
+                tour, cur, total = self._ils_segments(pool, tour, time_limit, tracker)
+            else:
+                for _ in range(chunks):
+                    jobs = [(tour, time_limit / chunks, self.rng.getrandbits(32), 0) for _ in range(workers)]
+                    results = pool.starmap(_run_chunk, jobs) if pool else [_run_chunk(*jobs[0])]
+                    cur, tour, _ = min(results, key=lambda r: r[0])
+                    total += sum(r[2] for r in results)
+                    if tracker:
+                        tracker.update(cur, "LK + ILS")
         finally:
             if pool:
                 pool.terminate()
         logger.info(f"LK + ILS (C, {workers} workers): {total} iterações, comprimento {cur}")
         return tour.tolist(), cur
+
+    def _ils_segments(self, pool, tour, time_limit, tracker):
+        # Instâncias grandes: cada processo otimiza um trecho contíguo do tour (na curva de Hilbert,
+        # uma região compacta), com as pontas fixas, e as melhorias de todos são aproveitadas.
+        # Os cortes mudam a cada rodada para que as fronteiras também sejam otimizadas.
+        n, workers, total = self.n, max(1, CONFIG['workers']), 0
+        neigh = np.ascontiguousarray(self.neigh, dtype=np.int32)
+        seg_of, loc = np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32)
+        cuts = np.linspace(0, n, workers + 1).astype(int)
+        for _ in range(CONFIG['sync_chunks']):
+            order = np.roll(tour, -self.rng.randrange(n))
+            segs = [order[cuts[i]:cuts[i + 1]] for i in range(workers)]
+            for i, sg in enumerate(segs):
+                seg_of[sg] = i
+                loc[sg] = np.arange(len(sg), dtype=np.int32)
+            jobs = []
+            for i, sg in enumerate(segs):
+                m = len(sg)
+                nbg = neigh[sg]
+                nb = np.where(seg_of[nbg] == i, loc[nbg], -1)
+                valid = nb >= 0
+                nb = np.take_along_axis(nb, np.argsort(~valid, axis=1, kind='stable'), axis=1)  # válidos à esquerda
+                cnt = valid.sum(axis=1)
+                last = np.where(cnt > 0, nb[np.arange(m), np.maximum(cnt - 1, 0)], (np.arange(m) + 1) % m)
+                nb = np.ascontiguousarray(np.where(nb >= 0, nb, last[:, None]), dtype=np.int32)
+                jobs.append((np.ascontiguousarray(self.xy[sg]), nb, time_limit / CONFIG['sync_chunks'],
+                             self.rng.getrandbits(32)))
+            results = pool.map(_segment_job, jobs)
+            tour = np.concatenate([sg[path] for sg, (path, _) in zip(segs, results)]).astype(np.int32)
+            total += sum(r[1] for r in results)
+            if tracker:
+                tracker.update(self.tour_length_c(tour), "LK + ILS (trechos)")
+        return tour, self.tour_length_c(tour), total
 
     def tour_length_c(self, tour):
         # Comprimento via núcleo (time_limit 0, sem busca local): mesma função de distância do LK.

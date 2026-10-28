@@ -2,7 +2,7 @@
 
 Solver heurístico de TSP (Caixeiro Viajante) em Python. Trabalho da disciplina de Otimização (IFPR Pinhais), co-autoria com Beatriz Nahas e Rafael Alves.
 
-Estado atual: `tsp.py` lê a instância e chama o núcleo C (`tsp_core.c`): tour inicial de Hilbert → Lin-Kernighan por flips com candidatos alpha-nearness → ILS com double-bridge local e aceite por temperatura; um processo por núcleo, sincronizando o melhor tour. Distâncias calculadas das coordenadas (sem matriz, memória O(n)); a matriz só é usada se vier no arquivo. Sem `cc`, cai no fallback Python (com matriz). Funciona de 1 a 200 mil nós; resultados no README.
+Estado atual: `tsp.py` lê a instância e chama o núcleo C (`tsp_core.c`): tour inicial de Hilbert → Lin-Kernighan por flips com candidatos alpha-nearness → ILS com double-bridge local e aceite por temperatura; um processo por núcleo (tour inteiro sincronizado até 20 mil nós; trechos com pontas fixas acima disso). Distâncias calculadas das coordenadas (sem matriz, memória O(n)); a matriz só é usada se vier no arquivo. Sem `cc`, cai no fallback Python (com matriz). Funciona de 1 a 200 mil nós; resultados no README.
 
 ## Stack
 

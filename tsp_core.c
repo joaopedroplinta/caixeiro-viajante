@@ -26,9 +26,14 @@ typedef struct {
     long last_gain;
     unsigned long long rng;
     int *jr; long jn, jcap; int journaling;   // reversões da iteração do ILS, para desfazer
+    int maxrev;        // maior reversão tentada pelo LK (0 = sem limite)
+    int fa, fb;        // aresta que nunca pode ser removida (-1 = nenhuma): fecha um trecho de tour
 } S;
 
+#define FIXED_EDGE 1000000000  // distância negativa da aresta fixa: o LK nunca a escolhe para remover
+
 static inline int dist(const S *s, int a, int b) {
+    if (s->fa >= 0 && ((a == s->fa && b == s->fb) || (a == s->fb && b == s->fa))) return -FIXED_EDGE;
     if (s->xy) {
         double dx = s->xy[2 * a] - s->xy[2 * b], dy = s->xy[2 * a + 1] - s->xy[2 * b + 1];
         return (int)(sqrt(dx * dx + dy * dy) + 0.5);
@@ -102,6 +107,13 @@ static int lk(S *s, int t1, int t2, long G, int depth) {
         if (t3 == t1) continue;
         int t4 = fw ? pred(s, t3) : succ(s, t3);
         if (t4 == t2) continue;
+        if (s->maxrev) {  // custo do flip = menor lado do caminho t2..t4
+            int len = fw ? s->pos[t4] - s->pos[t2] : s->pos[t2] - s->pos[t4];
+            if (len < 0) len += s->n;
+            len += 1;
+            if (len > s->n - len) len = s->n - len;
+            if (len > s->maxrev) continue;
+        }
         int bad = 0;
         for (int d = 0; d < depth; d++)
             if ((s->addA[d] == t3 && s->addB[d] == t4) || (s->addA[d] == t4 && s->addB[d] == t3)) { bad = 1; break; }
@@ -187,9 +199,10 @@ static double now(void) {
 // Retorna o comprimento final; *iters recebe o número de iterações do ILS.
 long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, int *tour,
                double time_limit, unsigned long long seed, int kick_window, int kick_window_large,
-               double temp, int init, long *iters) {
+               double temp, int init, int maxrev, int fix_a, int fix_b, long *iters) {
     S s; memset(&s, 0, sizeof s);
-    s.n = n; s.K = K; s.D = D; s.xy = xy; s.neigh = neigh; s.tour = tour;
+    s.fa = fix_a; s.fb = fix_b;
+    s.n = n; s.K = K; s.D = D; s.xy = xy; s.neigh = neigh; s.tour = tour;  // maxrev só vale no ILS: a busca local inicial precisa de reversões longas
     s.pos = malloc(n * sizeof(int)); s.queue = malloc(n * sizeof(int)); s.inq = calloc(n, 1);
     s.jcap = 1 << 12; s.jr = malloc(s.jcap * sizeof(int));
     s.rng = seed * 0x9E3779B97F4A7C15ULL + 88172645463325252ULL;
@@ -197,6 +210,13 @@ long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, i
 
     long cur = tour_length(&s);
     if (init) {
+        // 1º estágio com reversões curtas (barato), 2º sem limite para fechar o que faltou
+        if (maxrev) {
+            s.maxrev = maxrev;
+            for (int i = 0; i < n; i++) push(&s, tour[i]);
+            cur -= local_search(&s);
+            s.maxrev = 0;
+        }
         for (int i = 0; i < n; i++) push(&s, tour[i]);
         cur -= local_search(&s);
     }
@@ -214,6 +234,7 @@ long tsp_solve(int n, const int *D, const double *xy, int K, const int *neigh, i
         if (T > 0) { best = malloc(n * sizeof(int)); memcpy(best, tour, n * sizeof(int)); }
         double deadline = now() + time_limit;
         s.journaling = 1;
+        s.maxrev = maxrev;
         while (now() < deadline) {
             it++;
             s.jn = 0;
@@ -380,7 +401,7 @@ typedef struct { double a; int d, j; } AlphaCand;
 
 void tsp_alpha_candidates(int n, const int *D, const double *xy, int K0, const int *cand,
                           int K, long ub, int iters, int *out) {
-    S sv; memset(&sv, 0, sizeof sv); sv.n = n; sv.D = D; sv.xy = xy;
+    S sv; memset(&sv, 0, sizeof sv); sv.n = n; sv.D = D; sv.xy = xy; sv.fa = sv.fb = -1;
     S *s = &sv;
 
     // adjacência simétrica (CSR) do grafo de candidatos
