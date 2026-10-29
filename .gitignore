@@ -1,0 +1,4 @@
+__pycache__/
+*.so
+tsplib/*_solucao.txt
+tsplib/*_grafico.png

@@ -1,47 +1,63 @@
+import ctypes
+import multiprocessing as mp
+import subprocess
 import sys
 import math
-import heapq
 import random
-import multiprocessing as mp
 import time
-from itertools import combinations
 import logging
 import os
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# NÚCLEO EM C
+# Lin-Kernighan + ILS em tsp_core.c, compilado sob demanda. Sem compilador, cai no Python puro.
+def _load_core():
+    here = os.path.dirname(os.path.abspath(__file__))
+    src, lib = os.path.join(here, 'tsp_core.c'), os.path.join(here, 'libtspcore.so')
+    try:
+        if not os.path.exists(lib) or os.path.getmtime(lib) < os.path.getmtime(src):
+            subprocess.run(['cc', '-O3', '-march=native', '-shared', '-fPIC', src, '-o', lib],
+                           check=True, capture_output=True)
+        core = ctypes.CDLL(lib)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    ip = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
+    vp = ctypes.c_void_p  # D (int32 n*n) ou xy (float64 n*2); um deles é None
+    core.tsp_knn.restype = None
+    core.tsp_knn.argtypes = [ctypes.c_int, vp, ctypes.c_int, ip]
+    core.tsp_alpha_candidates.restype = None
+    core.tsp_alpha_candidates.argtypes = [ctypes.c_int, vp, vp, ctypes.c_int, ip, ctypes.c_int,
+                                          ctypes.c_long, ctypes.c_int, ip]
+    core.tsp_solve.restype = ctypes.c_long
+    core.tsp_solve.argtypes = [ctypes.c_int, vp, vp, ctypes.c_int, ip, ip, ctypes.c_double,
+                               ctypes.c_ulonglong, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_long)]
+    return core
+
+CORE = _load_core()
+
 # CONFIGURAÇÕES
 CONFIG = {
-    'max_clusters': 500000,
-    'nodes_per_cluster': 30,
-    'infinity': 1e9,
-    'tabu': {
-        'max_iterations': 200,
-        'tenure': 5,
-        'no_improve_limit': 500,
-        'log_frequency': 50,
-        'min_tenure': 1,
-        'max_tenure': 500,
-        'tenure_update_freq': 5
-    },
-    'opt3': {
-        'rounds': 10,
-        'max_segment': 75,
-        'workers': max(12, mp.cpu_count() // 2)
-    },
-    'perturbation': {
-        'count': 100,
-        'types': [0, 1, 2, 4, 5],
-        'cost_guided': True,
-        'between_rounds': True,
-        'rounds_count': 100
-    },
-    'optimization_rounds': 2,
+    'neighbors': 8,         # candidatos por cidade quando alpha = 0
+    'pool': 16,             # vizinhos mais próximos entre os quais o alpha escolhe
+    'alpha': 6,             # >0: K candidatos por alpha-nearness no lugar dos vizinhos mais próximos
+    'alpha_iters': 100,     # iterações do subgradiente (Held-Karp)
+    'time_limit': 30.0,     # segundos de ILS (sobrescrito pelo 2º argumento da CLI)
+    'kick_window': 50,      # tamanho máximo dos segmentos trocados no double-bridge local
+    'kick_window_large': 1000,  # idem, nos kicks "grandes" (metade das iterações; limitado a n/3)
+    'max_reversal': 1000,   # maior trecho que o LK inverte nas tentativas do ILS (e no 1º estágio da busca inicial)
+    'max_reversal_min_n': 12000,  # abaixo disso não há limite: a qualidade por iteração pesa mais que a velocidade
+    'segment_min_n': 20000,  # a partir daqui cada processo otimiza um trecho do tour (senão: todos no tour inteiro)
+    'large_kick_max_n': 5000,   # acima disso só há kicks pequenos
+    'workers': mp.cpu_count(),  # processos paralelos que compartilham o melhor tour (1 = serial)
+    'sync_chunks': 20,      # nº de rodadas de sincronização por execução
+    'accept_temp': 0.1,     # temperatura do aceite do ILS, em fração da aresta média (0 = só não piora)
+    'max_segment': 3,       # tamanho máximo do segmento movido pelo Or-opt
 }
 
 # RASTREAMENTO DE PROGRESSO
@@ -83,6 +99,22 @@ class ProgressTracker:
 # Utilitário para ler arquivos de instâncias TSP.
 class TSPReader:
     @staticmethod
+    def _read_tsplib(lines):
+        # Formato TSPLIB (EUC_2D): cabeçalho + NODE_COORD_SECTION "id x y".
+        nodes, coords, in_coords = [], {}, False
+        for line in lines:
+            line = line.strip()
+            if line.startswith("NODE_COORD_SECTION"):
+                in_coords = True
+            elif line.startswith("EOF"):
+                break
+            elif in_coords and line:
+                idx, x, y = line.split()[:3]
+                nodes.append(int(idx))
+                coords[int(idx)] = (float(x), float(y))
+        return nodes, coords, "EUC_2D", None, None
+
+    @staticmethod
     def read(filepath):
         # Lê arquivo, extrai nós, coordenadas, pesos e a seed.
         nodes = []
@@ -99,6 +131,9 @@ class TSPReader:
         except UnicodeDecodeError:
             with open(filepath, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
+
+        if any(l.strip().startswith("NODE_COORD_SECTION") for l in lines):
+            return TSPReader._read_tsplib(lines)
 
         for line in lines:
             line = line.strip()
@@ -166,550 +201,346 @@ class DistanceCalculator:
     def euclidean(p1, p2):
         # Calcula distância Euclidiana 2D arredondada entre dois pontos.
         dx, dy = p1[0] - p2[0], p1[1] - p2[1]
-        return int(round(math.hypot(dx, dy)))
+        return int(math.hypot(dx, dy) + 0.5)
+
+    @staticmethod
+    def matrix_from_xy(xy):
+        diff = xy[:, None, :] - xy[None, :, :]
+        return np.floor(np.sqrt(diff[..., 0] ** 2 + diff[..., 1] ** 2) + 0.5).astype(np.int64)
 
     @staticmethod
     def build_matrix(nodes, coords, weight_type, explicit_weights=None):
         # Constrói matriz de distâncias NxN (explícita ou calculada).
         if weight_type == "EXPLICIT" and explicit_weights:
             return explicit_weights
+        return DistanceCalculator.matrix_from_xy(np.array([coords[n] for n in nodes]))
 
-        n = len(nodes)
-        matrix = [[0]*n for _ in range(n)]
+_D = _XY = _NEIGH = None
 
-        for i in range(n):
-            for j in range(i+1, n):
-                d = DistanceCalculator.euclidean(coords[nodes[i]], coords[nodes[j]])
-                matrix[i][j] = matrix[j][i] = d
+def _max_reversal(n):
+    return CONFIG['max_reversal'] if n > CONFIG['max_reversal_min_n'] else 0
 
-        return matrix
+def _init_worker(D, xy, neigh):
+    global _D, _XY, _NEIGH
+    _D, _XY, _NEIGH = D, xy, neigh
 
-# CLUSTERIZAÇÃO
-# Divisão espacial do problema em subproblemas menores.
-class Clustering:
-    @staticmethod
-    def create_clusters(nodes, coords):
-        # Divide nós em clusters usando Quad-Tree ou divisão simples.
-        valid = {n: c for n, c in coords.items()
-                 if c[0] != float('inf') and c[1] != float('inf')}
+def _run_chunk(tour, seconds, seed, init):
+    # Roda o núcleo C a partir de `tour`; devolve (comprimento, tour, iterações).
+    tour = tour.copy()
+    iters = ctypes.c_long(0)
+    D = None if _D is None else _D.ctypes.data
+    xy = _XY.ctypes.data if _D is None else None
+    # kicks grandes só em instâncias pequenas: em n grande o reparo das arestas longas custa caro
+    large = CONFIG['kick_window_large'] if len(tour) <= CONFIG['large_kick_max_n'] else CONFIG['kick_window']
+    cur = CORE.tsp_solve(len(tour), D, xy, _NEIGH.shape[1], _NEIGH, tour, seconds, seed,
+                         CONFIG['kick_window'], large, CONFIG['accept_temp'], init, _max_reversal(len(tour)),
+                         -1, -1, ctypes.byref(iters))
+    return cur, tour, iters.value
 
-        if not valid:
-            return Clustering._simple_split(nodes)
+def _segment_job(args):
+    # ILS num trecho do tour como subproblema cíclico; a aresta de fechamento (m-1, 0) é fixa.
+    # Devolve o caminho 0 -> ... -> m-1 (índices locais) e o nº de iterações.
+    xy, nb, seconds, seed = args
+    m = len(xy)
+    tour = np.arange(m, dtype=np.int32)
+    large = CONFIG['kick_window_large'] if m <= CONFIG['large_kick_max_n'] else CONFIG['kick_window']
+    iters = ctypes.c_long(0)
+    CORE.tsp_solve(m, None, xy.ctypes.data, nb.shape[1], nb, tour, seconds, seed, CONFIG['kick_window'],
+                   large, CONFIG['accept_temp'], 0, _max_reversal(m), m - 1, 0, ctypes.byref(iters))
+    p = int(np.flatnonzero(tour == 0)[0])
+    path = np.roll(tour, -p)
+    if path[1] == m - 1:  # a aresta fixa vem logo depois do 0: percorre ao contrário
+        path = np.concatenate(([0], path[1:][::-1]))
+    return path, iters.value
 
-        xs = [c[0] for c in valid.values()]
-        ys = [c[1] for c in valid.values()]
-        clusters = []
-
-        def quad_divide(node_list, x_min, x_max, y_min, y_max, depth=0):
-            if len(node_list) <= CONFIG['nodes_per_cluster'] or depth > 10:
-                if node_list and len(clusters) < CONFIG['max_clusters']:
-                    clusters.append(node_list)
-                return
-
-            x_mid = (x_min + x_max) / 2
-            y_mid = (y_min + y_max) / 2
-            quadrants = [[], [], [], []]
-
-            for n in node_list:
-                x, y = valid.get(n, (x_min, y_min))
-                quad = (0 if x < x_mid else 1) + (0 if y < y_mid else 2)
-                quadrants[quad].append(n)
-
-            ranges = [
-                (x_min, x_mid, y_min, y_mid),
-                (x_mid, x_max, y_min, y_mid),
-                (x_min, x_mid, y_mid, y_max),
-                (x_mid, x_max, y_mid, y_max)
-            ]
-
-            for quad, (xmin, xmax, ymin, ymax) in zip(quadrants, ranges):
-                if quad:
-                    quad_divide(quad, xmin, xmax, ymin, ymax, depth+1)
-
-        quad_divide(nodes, min(xs), max(xs), min(ys), max(ys))
-        return clusters[:CONFIG['max_clusters']]
+# BUSCA LOCAL
+# 2-opt + Or-opt com listas de vizinhos e fila de cidades "sujas" (don't-look bits).
+# Trabalha em índices 0..n-1; delta acumulado evita recalcular o comprimento do tour.
+class LocalSearch:
+    def __init__(self, D, neigh):
+        self.D = D          # lista de listas (acesso escalar mais rápido que numpy)
+        self.neigh = neigh  # neigh[a] = vizinhos de a por distância crescente
+        self.n = len(D)
 
     @staticmethod
-    def _simple_split(nodes):
-        # Fatia lista de nós sequencialmente (fallback).
-        size = CONFIG['nodes_per_cluster']
-        return [nodes[i:i+size] for i in range(0, len(nodes), size)]
+    def build_pos(tour, pos):
+        for i, c in enumerate(tour):
+            pos[c] = i
 
-    @staticmethod
-    def find_border_nodes(cluster, coords, index_map):
-        # Encontra nós extremos do cluster para conexão eficiente.
-        valid = [n for n in cluster if n in index_map and n in coords]
-        if not valid:
-            return cluster[0], cluster[0]
+    def _reverse(self, tour, pos, i, j):
+        # Inverte o caminho de posições i..j (cíclico); inverte o complemento se der a volta.
+        if i > j:
+            i, j = j + 1, i - 1
+        tour[i:j + 1] = tour[i:j + 1][::-1]
+        for k in range(i, j + 1):
+            pos[tour[k]] = k
 
-        valid_coords = {n: coords[n] for n in valid
-                        if coords[n][0] != float('inf')}
-        if not valid_coords:
-            return valid[0], valid[0]
+    def _try_two_opt(self, a, tour, pos):
+        D, n = self.D, self.n
+        Da = D[a]
+        for forward in (True, False):
+            step = 1 if forward else -1
+            b = tour[(pos[a] + step) % n]
+            dab = Da[b]
+            for c in self.neigh[a]:
+                if dab - Da[c] <= 0:
+                    break
+                d = tour[(pos[c] + step) % n]
+                if c == b or d == a:
+                    continue
+                delta = Da[c] + D[b][d] - dab - D[c][d]
+                if delta < 0:
+                    if forward:
+                        self._reverse(tour, pos, pos[b], pos[c])
+                    else:
+                        self._reverse(tour, pos, pos[a], pos[d])
+                    return delta, (a, b, c, d)
+        return None
 
-        start = min(valid_coords, key=lambda n: (valid_coords[n][1], valid_coords[n][0]))
-        end = max(valid_coords, key=lambda n: (-valid_coords[n][1], valid_coords[n][0]))
-        return start, end
+    def _try_or_opt(self, a, tour, pos):
+        D, n = self.D, self.n
+        Da = D[a]
+        i = pos[a]
+        for L in range(1, CONFIG['max_segment'] + 1):
+            for forward in (True, False):
+                step = 1 if forward else -1
+                seg = [tour[(i + step * k) % n] for k in range(L)]  # seg[0] == a
+                z = seg[-1]
+                p = tour[(i - step) % n]
+                q = tour[(i + step * L) % n]
+                gain = D[p][a] + D[z][q] - D[p][q]
+                if gain <= 0:
+                    continue
+                segset = set(seg)
+                for c in self.neigh[a]:
+                    if Da[c] >= gain:
+                        break
+                    if c in segset:
+                        continue
+                    pc = pos[c]
+                    for e in (tour[(pc + 1) % n], tour[pc - 1]):
+                        if e in segset:
+                            continue
+                        delta = Da[c] + D[z][e] - D[c][e] - gain
+                        if delta < 0:
+                            self._move_segment(tour, pos, seg, forward, c, e)
+                            return delta, (p, q, a, z, c, e)
+        return None
 
-# CONSTRUÇÃO DE TOUR
-# Construção de rotas iniciais.
-class TourBuilder:
-    @staticmethod
-    def dijkstra_tree(cluster, start, dist_matrix, index_map):
-        # Gera árvore de caminhos mínimos aproximada via Dijkstra.
-        if len(cluster) <= 1 or start not in index_map:
-            return []
+    def _move_segment(self, tour, pos, seg, forward, c, e):
+        # Reinsere seg entre c e e, com seg[0] colado em c.
+        n, L = self.n, len(seg)
+        s = pos[seg[0]] if forward else pos[seg[-1]]  # posição inicial do segmento no tour
+        rest = tour[s + L:] + tour[:s] if s + L <= n else tour[(s + L) % n:s]
+        k = rest.index(c)
+        if k + 1 < len(rest) and rest[k + 1] == e:
+            ins, piece = k + 1, seg
+        else:
+            ins, piece = k, seg[::-1]
+        tour[:] = rest[:ins] + piece + rest[ins:]
+        self.build_pos(tour, pos)
 
-        pq = [(0, start, [start])]
-        visited = set()
-        paths = {}
-
-        while pq:
-            cost, node, path = heapq.heappop(pq)
-            if node in visited:
-                continue
-            visited.add(node)
-            paths[node] = path
-
-            for next_node in cluster:
-                if next_node not in visited and next_node in index_map:
-                    new_cost = cost + dist_matrix[index_map[node]][index_map[next_node]]
-                    heapq.heappush(pq, (new_cost, next_node, path + [next_node]))
-
-        edges = []
-        for path in paths.values():
-            for i in range(len(path)-1):
-                edges.append((path[i], path[i+1]))
-        return edges
-
-    @staticmethod
-    def dfs_tour(edges, start, dist_matrix, index_map):
-        # Converte árvore de arestas em rota linear via DFS.
-        if not edges or start not in index_map:
-            return []
-
-        adjacency = {}
-        for u, v in edges:
-            adjacency.setdefault(u, []).append(v)
-            adjacency.setdefault(v, []).append(u)
-
-        tour = []
-        stack = [start]
-        visited = set()
-
-        while stack:
-            node = stack.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            tour.append(node)
-
-            neighbors = [(n, dist_matrix[index_map[node]][index_map[n]])
-                         for n in adjacency.get(node, []) if n not in visited]
-            neighbors.sort(key=lambda x: x[1])
-            stack.extend([n for n, _ in neighbors])
-
-        return tour
-
-    @staticmethod
-    def calculate_length(tour, dist_matrix, index_map):
-        # Calcula distância total de uma rota cíclica.
-        if not tour or len(tour) < 2:
-            return CONFIG['infinity']
-
+    def run(self, tour, pos, dirty):
+        # Melhora o tour in-place a partir das cidades em `dirty`; devolve o delta total.
+        inq = [False] * self.n
+        stack = []
+        for c in dirty:
+            if not inq[c]:
+                inq[c] = True
+                stack.append(c)
         total = 0
-        for i in range(len(tour)):
-            u, v = tour[i], tour[(i+1) % len(tour)]
-            if u not in index_map or v not in index_map:
-                return CONFIG['infinity']
-            total += dist_matrix[index_map[u]][index_map[v]]
+        while stack:
+            a = stack.pop()
+            inq[a] = False
+            while True:
+                move = self._try_two_opt(a, tour, pos) or self._try_or_opt(a, tour, pos)
+                if not move:
+                    break
+                delta, touched = move
+                total += delta
+                for c in touched:
+                    if not inq[c]:
+                        inq[c] = True
+                        stack.append(c)
         return total
 
-# OTIMIZAÇÕES LOCAIS
-# Heurísticas de melhoria local.
-class LocalOptimizer:
-    @staticmethod
-    def two_opt(tour, dist_matrix, idx_map, tracker=None, label="2-opt"):
-        # Aplica heurística 2-opt para remover cruzamentos de arestas.
-        if len(tour) < 4:
-            return tour[:]
+# CONSTRUÇÃO E BUSCA ITERADA
+class Solver:
+    def __init__(self, rng, xy, D=None):
+        # D: matriz de distâncias; None = o núcleo C calcula EUC_2D direto das coordenadas.
+        self.xy = np.ascontiguousarray(xy, dtype=np.float64)
+        self.n = len(self.xy)
+        self.rng = rng
+        if D is None and not CORE:
+            D = DistanceCalculator.matrix_from_xy(self.xy)
+        self.D = None if D is None else np.asarray(D)
+        self.D32 = None if D is None else np.ascontiguousarray(self.D, dtype=np.int32)
+        self.start_tour = None  # tour já passado pela busca local (preenchido ao calcular o alpha)
+        self.neigh = self._candidates()
+        if not CORE:  # a lista de listas só serve ao fallback Python (e custa ~n² objetos)
+            self.ls = LocalSearch(self.D.tolist(), self.neigh.tolist())
 
-        improved = True
-        best = tour[:]
-        n = len(tour)
+    def _ptrs(self):
+        return (None if self.D32 is None else self.D32.ctypes.data), (self.xy.ctypes.data if self.D32 is None else None)
 
-        while improved:
-            improved = False
-            for i in range(n-1):
-                for j in range(i+2, n if i > 0 else n-1):
-                    a, b = tour[i], tour[(i+1) % n]
-                    c, d = tour[j], tour[(j+1) % n]
+    def _candidates(self):
+        n = self.n
+        pool = min(CONFIG['pool'], n - 1)
+        if self.D32 is None:
+            cand = np.empty((n, pool), dtype=np.int32)
+            CORE.tsp_knn(n, self.xy.ctypes.data, pool, cand)
+        else:
+            masked = self.D + np.diag(np.full(n, np.iinfo(self.D.dtype).max // 2))
+            cand = np.ascontiguousarray(np.argsort(masked, axis=1, kind='stable')[:, :pool], dtype=np.int32)
+        if CORE and CONFIG['alpha'] > 0 and n >= 8:
+            return self._alpha_neighbors(cand, min(CONFIG['alpha'], pool))
+        return np.ascontiguousarray(cand[:, :min(CONFIG['neighbors'], pool)])
 
-                    if all(x in idx_map for x in [a,b,c,d]):
-                        delta = (dist_matrix[idx_map[a]][idx_map[c]] +
-                                 dist_matrix[idx_map[b]][idx_map[d]] -
-                                 dist_matrix[idx_map[a]][idx_map[b]] -
-                                 dist_matrix[idx_map[c]][idx_map[d]])
+    def _alpha_neighbors(self, cand, k):
+        # Limite superior = tour já melhorado pela busca local; guia o passo do subgradiente.
+        D, xy = self._ptrs()
+        tour = self.initial_tour()
+        near = np.ascontiguousarray(cand[:, :CONFIG['neighbors']])
+        ub = CORE.tsp_solve(self.n, D, xy, near.shape[1], near, tour, 0.0, 1,
+                            CONFIG['kick_window'], CONFIG['kick_window'], 0.0, 1, _max_reversal(self.n),
+                            -1, -1, ctypes.byref(ctypes.c_long(0)))
+        self.start_tour = tour
+        out = np.zeros((self.n, k), dtype=np.int32)
+        CORE.tsp_alpha_candidates(self.n, D, xy, cand.shape[1], cand, k, ub, CONFIG['alpha_iters'], out)
+        return out
 
-                        if delta < 0:
-                            tour[i+1:j+1] = reversed(tour[i+1:j+1])
-                            improved = True
-                            if tracker:
-                                length = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
-                                tracker.update(length, label)
-                            best = tour[:]
+    def initial_tour(self):
+        # Curva de Hilbert: O(n log n); a busca local corrige o resto.
+        xy = self.xy
+        span = max(float(np.ptp(xy, axis=0).max()), 1e-9)
+        g = ((xy - xy.min(axis=0)) / span * 65535).astype(np.int64)
+        x, y = g[:, 0].copy(), g[:, 1].copy()
+        d = np.zeros(self.n, dtype=np.int64)
+        s = 1 << 15
+        while s:
+            rx, ry = (x & s) > 0, (y & s) > 0
+            d += s * s * ((3 * rx) ^ ry)
+            refl = rx & ~ry
+            x, y = np.where(refl, 65535 - x, x), np.where(refl, 65535 - y, y)
+            x, y = np.where(~ry, y, x), np.where(~ry, x, y)
+            s >>= 1
+        return np.argsort(d, kind='stable').astype(np.int32)
 
-        return best
+    def length(self, tour):
+        D = self.ls.D
+        return sum(D[tour[i - 1]][tour[i]] for i in range(self.n))
 
-    @staticmethod
-    def tabu_search(tour, dist_matrix, idx_map, tracker, label="tabu"):
-        # Busca Tabu com lista de movimentos proibidos temporariamente.
-        best = tour[:]
-        best_len = TourBuilder.calculate_length(best, dist_matrix, idx_map)
-        tabu_list = {}
-        no_improve = 0
-        n = len(tour)
-        tenure = CONFIG['tabu']['tenure']
+    def _kick(self, tour):
+        # Double-bridge local: troca dois segmentos adjacentes numa janela pequena.
+        n, D = self.n, self.ls.D
+        w = max(1, min(CONFIG['kick_window'], (n - 2) // 3))
+        r = self.rng.randrange(n)
+        l1, l2 = self.rng.randint(1, w), self.rng.randint(1, w)
+        t = tour[r:] + tour[:r]
+        a, b1, b2, c1, c2, d = t[0], t[1], t[l1], t[l1 + 1], t[l1 + l2], t[(l1 + l2 + 1) % n]
+        delta = (D[a][c1] + D[c2][b1] + D[b2][d]) - (D[a][b1] + D[b2][c1] + D[c2][d])
+        tour[:] = [a] + t[l1 + 1:l1 + l2 + 1] + t[1:l1 + 1] + t[l1 + l2 + 1:]
+        return delta, (a, b1, b2, c1, c2, d)
 
-        for iteration in range(1, CONFIG['tabu']['max_iterations']+1):
-            best_move = None
-            best_delta = CONFIG['infinity']
+    def solve(self, time_limit, tracker=None):
+        return self._solve_c(time_limit, tracker) if CORE else self._solve_python(time_limit, tracker)
 
-            for i in range(n-1):
-                for j in range(i+2, n if i > 0 else n-1):
-                    a, b = tour[i], tour[(i+1) % n]
-                    c, d = tour[j], tour[(j+1) % n]
-
-                    if all(x in idx_map for x in [a,b,c,d]):
-                        if (a,c) in tabu_list and tabu_list[(a,c)] > iteration:
-                            continue
-
-                        delta = (dist_matrix[idx_map[a]][idx_map[c]] +
-                                 dist_matrix[idx_map[b]][idx_map[d]] -
-                                 dist_matrix[idx_map[a]][idx_map[b]] -
-                                 dist_matrix[idx_map[c]][idx_map[d]])
-
-                        if delta < best_delta:
-                            best_delta = delta
-                            best_move = (i, j)
-
-            if not best_move:
-                break
-
-            i, j = best_move
-            tour[i+1:j+1] = reversed(tour[i+1:j+1])
-            tabu_list[(tour[i], tour[i+1])] = iteration + tenure
-
-            current_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
-            if current_len < best_len:
-                best = tour[:]
-                best_len = current_len
-                no_improve = 0
-                if tracker:
-                    tracker.update(best_len, label)
+    def _solve_c(self, time_limit, tracker=None):
+        # Rodadas curtas: em cada uma, os workers partem do melhor tour com seeds diferentes.
+        chunks, workers = CONFIG['sync_chunks'], max(1, CONFIG['workers'])
+        neigh = np.ascontiguousarray(self.neigh, dtype=np.int32)
+        _init_worker(self.D32, self.xy, neigh)
+        if self.start_tour is not None:
+            tour = self.start_tour
+            cur = self.tour_length_c(tour)
+        else:  # busca local completa uma vez, no processo principal
+            cur, tour, _ = _run_chunk(self.initial_tour(), 0.0, 0, 1)
+        if tracker:
+            tracker.update(cur, "LK")
+        pool = mp.get_context('fork').Pool(workers) if workers > 1 and 'fork' in mp.get_all_start_methods() else None
+        total = 0
+        try:
+            if pool and self.n >= CONFIG['segment_min_n']:
+                tour, cur, total = self._ils_segments(pool, tour, time_limit, tracker)
             else:
-                no_improve += 1
+                for _ in range(chunks):
+                    jobs = [(tour, time_limit / chunks, self.rng.getrandbits(32), 0) for _ in range(workers)]
+                    results = pool.starmap(_run_chunk, jobs) if pool else [_run_chunk(*jobs[0])]
+                    cur, tour, _ = min(results, key=lambda r: r[0])
+                    total += sum(r[2] for r in results)
+                    if tracker:
+                        tracker.update(cur, "LK + ILS")
+        finally:
+            if pool:
+                pool.terminate()
+        logger.info(f"LK + ILS (C, {workers} workers): {total} iterações, comprimento {cur}")
+        return tour.tolist(), cur
 
-            if iteration % CONFIG['tabu']['tenure_update_freq'] == 0:
-                tenure = min(tenure + 15, CONFIG['tabu']['max_tenure'])
+    def _ils_segments(self, pool, tour, time_limit, tracker):
+        # Instâncias grandes: cada processo otimiza um trecho contíguo do tour (na curva de Hilbert,
+        # uma região compacta), com as pontas fixas, e as melhorias de todos são aproveitadas.
+        # Os cortes mudam a cada rodada para que as fronteiras também sejam otimizadas.
+        n, workers, total = self.n, max(1, CONFIG['workers']), 0
+        neigh = np.ascontiguousarray(self.neigh, dtype=np.int32)
+        seg_of, loc = np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32)
+        cuts = np.linspace(0, n, workers + 1).astype(int)
+        for _ in range(CONFIG['sync_chunks']):
+            order = np.roll(tour, -self.rng.randrange(n))
+            segs = [order[cuts[i]:cuts[i + 1]] for i in range(workers)]
+            for i, sg in enumerate(segs):
+                seg_of[sg] = i
+                loc[sg] = np.arange(len(sg), dtype=np.int32)
+            jobs = []
+            for i, sg in enumerate(segs):
+                m = len(sg)
+                nbg = neigh[sg]
+                nb = np.where(seg_of[nbg] == i, loc[nbg], -1)
+                valid = nb >= 0
+                nb = np.take_along_axis(nb, np.argsort(~valid, axis=1, kind='stable'), axis=1)  # válidos à esquerda
+                cnt = valid.sum(axis=1)
+                last = np.where(cnt > 0, nb[np.arange(m), np.maximum(cnt - 1, 0)], (np.arange(m) + 1) % m)
+                nb = np.ascontiguousarray(np.where(nb >= 0, nb, last[:, None]), dtype=np.int32)
+                jobs.append((np.ascontiguousarray(self.xy[sg]), nb, time_limit / CONFIG['sync_chunks'],
+                             self.rng.getrandbits(32)))
+            results = pool.map(_segment_job, jobs)
+            tour = np.concatenate([sg[path] for sg, (path, _) in zip(segs, results)]).astype(np.int32)
+            total += sum(r[1] for r in results)
+            if tracker:
+                tracker.update(self.tour_length_c(tour), "LK + ILS (trechos)")
+        return tour, self.tour_length_c(tour), total
 
-            if no_improve >= CONFIG['tabu']['no_improve_limit']:
-                break
+    def tour_length_c(self, tour):
+        # Comprimento via núcleo (time_limit 0, sem busca local): mesma função de distância do LK.
+        return _run_chunk(tour, 0.0, 0, 0)[0]
 
-        return best
+    def _solve_python(self, time_limit, tracker=None):
+        tour = self.initial_tour().tolist()
+        pos = [0] * self.n
+        LocalSearch.build_pos(tour, pos)
+        cur = self.length(tour)
+        logger.info(f"Vizinho mais próximo: {cur}")
+        cur += self.ls.run(tour, pos, tour[:])
+        logger.info(f"2-opt + Or-opt: {cur}")
+        if tracker:
+            tracker.update(cur, "busca local")
 
-# 3-OPT
-# Otimização 3-opt com processamento paralelo.
-class ThreeOpt:
-    @staticmethod
-    def _calculate_delta(tour, dist_matrix, idx_map, i, j, k):
-        # Calcula ganho de trocar 3 arestas (4 recombinações).
-        try:
-            A, B = tour[i-1], tour[i]
-            C, D = tour[j-1], tour[j]
-            E, F = tour[k-1], tour[k]
-
-            if any(n not in idx_map for n in [A, B, C, D, E, F]):
-                return 0, 0
-
-            cost_original = (dist_matrix[idx_map[A]][idx_map[B]] +
-                             dist_matrix[idx_map[C]][idx_map[D]] +
-                             dist_matrix[idx_map[E]][idx_map[F]])
-
-            best_delta = 0
-            best_option = 0
-
-            options = [
-                (A, C, B, D, E, F),
-                (A, B, C, E, D, F),
-                (A, C, D, E, B, F),
-                (A, D, C, B, E, F),
-            ]
-
-            for opt_num, (n1, n2, n3, n4, n5, n6) in enumerate(options, 1):
-                cost = (dist_matrix[idx_map[n1]][idx_map[n2]] +
-                        dist_matrix[idx_map[n3]][idx_map[n4]] +
-                        dist_matrix[idx_map[n5]][idx_map[n6]])
-                delta = cost - cost_original
-                if delta < best_delta:
-                    best_delta = delta
-                    best_option = opt_num
-
-            return best_delta, best_option
-        except:
-            return 0, 0
-
-    @staticmethod
-    def _apply_swap(tour, i, j, k, option):
-        # Aplica a troca 3-opt reordenando segmentos.
-        segment1 = tour[:i]
-        segment2 = tour[i:j]
-        segment3 = tour[j:k]
-        segment4 = tour[k:]
-
-        if option == 0:
-            return tour
-        elif option == 1:
-            return segment1 + segment2[::-1] + segment3 + segment4
-        elif option == 2:
-            return segment1 + segment2 + segment3[::-1] + segment4
-        elif option == 3:
-            return segment1 + segment2[::-1] + segment3[::-1] + segment4
-        elif option == 4:
-            return segment1 + segment3 + segment2 + segment4
-        return tour
-
-    @staticmethod
-    def _evaluate_triplet_chunk(args):
-        # Avalia lote de trincas em paralelo buscando melhoria.
-        tour, dist_matrix, idx_map, triplets = args
-        base_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
-
-        for i, j, k in triplets:
-            best_delta, best_option = ThreeOpt._calculate_delta(tour, dist_matrix, idx_map, i, j, k)
-            if best_delta < 0:
-                new_tour = ThreeOpt._apply_swap(tour, i, j, k, best_option)
-                new_len = TourBuilder.calculate_length(new_tour, dist_matrix, idx_map)
-                if new_len < base_len:
-                    return new_tour, new_len
-
-        return None, None
-
-    @staticmethod
-    def optimize(tour, dist_matrix, idx_map, tracker, label="3-opt"):
-        # Executa otimização 3-opt paralela em rodadas.
-        best_tour = tour[:]
-        best_length = TourBuilder.calculate_length(best_tour, dist_matrix, idx_map)
-        n = len(best_tour)
-
-        for round_num in range(1, CONFIG['opt3']['rounds'] + 1):
-            triplets = []
-            for i in range(1, n-2):
-                for j in range(i+1, n-1):
-                    if j - i > CONFIG['opt3']['max_segment']:
-                        break
-                    for k in range(j+1, n):
-                        if k - i > CONFIG['opt3']['max_segment']:
-                            break
-                        triplets.append((i, j, k))
-
-            if not triplets:
-                break
-
-            random.shuffle(triplets)
-            chunk_size = max(1, len(triplets) // CONFIG['opt3']['workers'])
-            chunks = [triplets[i:i+chunk_size] for i in range(0, len(triplets), chunk_size)]
-            args_list = [(best_tour[:], dist_matrix, idx_map, chunk) for chunk in chunks]
-
-            try:
-                with mp.Pool(CONFIG['opt3']['workers']) as pool:
-                    results = pool.map(ThreeOpt._evaluate_triplet_chunk, args_list)
-            except:
-                return best_tour
-
-            found_improvement = None
-            best_in_round = best_length
-            for new_tour, new_len in results:
-                if new_tour is not None and new_len < best_in_round:
-                    best_in_round = new_len
-                    found_improvement = new_tour
-
-            if found_improvement and best_in_round < best_length:
-                best_tour = found_improvement[:]
-                best_length = best_in_round
-                if tracker:
-                    tracker.update(best_length, label)
+        deadline = time.time() + time_limit
+        iters = 0
+        while time.time() < deadline and self.n >= 8:
+            iters += 1
+            old_tour, old_pos = tour[:], pos[:]
+            delta, touched = self._kick(tour)
+            LocalSearch.build_pos(tour, pos)
+            delta += self.ls.run(tour, pos, touched)
+            if delta <= 0:
+                cur += delta
+                if delta < 0 and tracker:
+                    tracker.update(cur, "ILS")
             else:
-                break
+                tour[:], pos[:] = old_tour, old_pos
+        logger.info(f"ILS: {iters} iterações, comprimento {cur}")
+        return tour, cur
 
-        return best_tour
-
-# PERTURBAÇÕES
-# Aplica 'chutes' na solução para escapar de mínimos locais.
-class Perturbation:
-    @staticmethod
-    def perturb(tour, strategy, idx_map, high_cost_edges=None):
-        # Aplica Double-Bridge, Multi 2-opt ou Embaralhamento.
-        perturbed = tour[:]
-        n = len(tour)
-        if n < 5:
-            return perturbed
-
-        if strategy == 0:  # Double-Bridge
-            indices = sorted(random.sample(range(n-1), min(4, n-1)))
-            if len(indices) == 4:
-                i1, i2, i3, i4 = indices
-                if i2-i1 >= 1 and i4-i3 >= 1 and i3-i2 >= 1:
-                    perturbed = (tour[:i1+1] + tour[i3+1:i4+1] +
-                               tour[i2+1:i3+1] + tour[i1+1:i2+1] + tour[i4+1:])
-
-        elif strategy == 1:  # Multi 2-opt
-            temp = tour[:]
-            for _ in range(random.randint(2, 5)):
-                i = random.randint(0, n - 2)
-                j = random.randint(i + 2, n - 1)
-                if j - i >= 2:
-                    temp[i+1:j+1] = temp[i+1:j+1][::-1]
-            perturbed = temp
-
-        elif strategy == 2:  # Embaralhamento de segmentos
-            segment_size = max(2, n // 20)
-            start = random.randint(0, max(0, n - segment_size - 1))
-            segment = perturbed[start:start+segment_size]
-            random.shuffle(segment)
-            perturbed = perturbed[:start] + segment + perturbed[start+segment_size:]
-
-        return perturbed
-
-    @staticmethod
-    def evaluate_perturbation_worker(args):
-        # Worker paralelo: perturba e aplica 2-opt rápido.
-        tour, dist_matrix, idx_map, coords, strategy, iteration, high_cost_edges = args
-        try:
-            perturbed = Perturbation.perturb(tour, strategy, idx_map, high_cost_edges)
-            perturbed = TourUtils.remove_subtours(perturbed, dist_matrix, idx_map, coords)
-            perturbed = LocalOptimizer.two_opt(perturbed, dist_matrix, idx_map, None, "")
-            length_optimized = TourBuilder.calculate_length(perturbed, dist_matrix, idx_map)
-            return perturbed, length_optimized, iteration, strategy
-        except:
-            return tour[:], CONFIG['infinity'], iteration, strategy
-
-    @staticmethod
-    def apply_multiple(tour, dist_matrix, idx_map, coords, tracker, num_perturbations):
-        # Gera múltiplas perturbações (ILS) e escolhe a melhor.
-        original_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
-        best_tour = tour[:]
-        best_len = original_len
-
-        tasks = []
-        for iter_num in range(num_perturbations):
-            strategy = random.choice(CONFIG['perturbation']['types'])
-            tasks.append((tour[:], dist_matrix, idx_map, coords, strategy, iter_num, []))
-
-        try:
-            with mp.Pool(CONFIG['opt3']['workers']) as pool:
-                results = pool.map(Perturbation.evaluate_perturbation_worker, tasks)
-        except:
-            results = [(tour[:], original_len, i, 0) for i in range(num_perturbations)]
-
-        for perturbed_tour, length, iter_num, strategy in results:
-            if length < best_len and length != CONFIG['infinity']:
-                best_tour = perturbed_tour[:]
-                best_len = length
-                if tracker:
-                    tracker.update(best_len, "perturbation")
-
-        if best_len >= original_len:
-            best_tour = tour[:]
-
-        return best_tour
-
-# UTILITÁRIOS
-# Manipulação da estrutura da rota.
-class TourUtils:
-    @staticmethod
-    def remove_subtours(tour, dist_matrix, idx_map, coords):
-        # Reconecta componentes desconexos em um único ciclo.
-        n = len(tour)
-        if n <= 1:
-            return tour
-
-        adjacency = {}
-        for i in range(n):
-            u, v = tour[i], tour[(i+1) % n]
-            if u in idx_map and v in idx_map:
-                adjacency.setdefault(u, []).append(v)
-                adjacency.setdefault(v, []).append(u)
-
-        visited = set()
-        components = []
-
-        def dfs_component(start):
-            component = []
-            stack = [start]
-            while stack:
-                node = stack.pop()
-                if node not in visited:
-                    visited.add(node)
-                    component.append(node)
-                    for neighbor in adjacency.get(node, []):
-                        if neighbor not in visited:
-                            stack.append(neighbor)
-            return component
-
-        for node in tour:
-            if node not in visited and node in idx_map:
-                comp = dfs_component(node)
-                if comp:
-                    components.append(comp)
-
-        if len(components) <= 1:
-            return tour
-
-        merged = components[0]
-        for comp in components[1:]:
-            merged = merged[:-1] + comp + [merged[0]]
-
-        return merged
-
-    @staticmethod
-    def merge_tours(tour1, tour2, dist_matrix, idx_map):
-        # Funde duas rotas minimizando custo de inserção.
-        if not tour1 or not tour2:
-            return tour1 if tour1 else tour2 if tour2 else []
-
-        t1, t2 = tour1[:-1], tour2[:-1]
-        best_gain = -CONFIG['infinity']
-        best_connection = None
-
-        for i in range(len(t1)):
-            u1, v1 = t1[i], t1[(i+1) % len(t1)]
-            if u1 not in idx_map or v1 not in idx_map:
-                continue
-
-            for j in range(len(t2)):
-                u2, v2 = t2[j], t2[(j+1) % len(t2)]
-                if u2 not in idx_map or v2 not in idx_map:
-                    continue
-
-                current_cost = (dist_matrix[idx_map[u1]][idx_map[v1]] +
-                              dist_matrix[idx_map[u2]][idx_map[v2]])
-
-                gain1 = current_cost - (dist_matrix[idx_map[u1]][idx_map[u2]] +
-                                     dist_matrix[idx_map[v1]][idx_map[v2]])
-                if gain1 > best_gain:
-                    best_gain = gain1
-                    best_connection = (i, j, False)
-
-        if best_connection is None:
-            return t1 + t2 + [t1[0]]
-
-        i, j, reverse = best_connection
-        t2_reordered = t2[j+1:] + t2[:j+1]
-        if reverse:
-            t2_reordered.reverse()
-
-        return t1[:i+1] + t2_reordered + t1[i+1:] + [t1[0]]
 
 # VISUALIZAÇÃO
 # Plota o tour e o gráfico de convergência.
@@ -719,19 +550,12 @@ def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_res
     # Gráfico 1: Rota do TSP
     ax1 = plt.subplot(1, 2, 1)
     
-    # Plota as arestas do tour
-    for i in range(len(tour)):
-        u, v = tour[i], tour[(i+1) % len(tour)]
-        if u in coords and v in coords:
-            x1, y1 = coords[u]
-            x2, y2 = coords[v]
-            ax1.plot([x1, x2], [y1, y2], 'b-', linewidth=1, alpha=0.6)
-    
-    # Plota os nós
-    xs = [coords[node][0] for node in tour if node in coords]
-    ys = [coords[node][1] for node in tour if node in coords]
-    ax1.scatter(xs, ys, c='blue', s=20, zorder=5)
-    
+    # Plota o tour (já fechado: primeiro == último) numa única linha; nós só em instâncias pequenas
+    pts = np.array([coords[n] for n in tour if n in coords])
+    ax1.plot(pts[:, 0], pts[:, 1], 'b-', linewidth=1, alpha=0.6)
+    if len(pts) <= 3000:
+        ax1.scatter(pts[:, 0], pts[:, 1], c='blue', s=20, zorder=5)
+
     ax1.set_title(f'Melhor rota encontrada: {final_length:.2f}', fontsize=14, fontweight='bold')
     ax1.set_xlabel('Coordenada X', fontsize=12)
     ax1.set_ylabel('Coordenada Y', fontsize=12)
@@ -751,7 +575,7 @@ def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_res
         
         final_gap = gaps[-1]
         ax2.set_yscale('log')
-        ax2.set_title(f'Gap de Otimalidade (Final: {final_gap:.2f}%)', fontsize=14, fontweight='bold')
+        ax2.set_title(f'Gap em relação à melhor solução (Final: {final_gap:.2f}%)', fontsize=14, fontweight='bold')
         ax2.set_xlabel('Iteração', fontsize=12)
         ax2.set_ylabel('Gap (%)', fontsize=12)
         ax2.legend(loc='upper right')
@@ -759,152 +583,50 @@ def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_res
     else:
         ax2.text(0.5, 0.5, 'Sem histórico de gap disponível', 
                 ha='center', va='center', transform=ax2.transAxes, fontsize=12)
-        ax2.set_title('Gap de Otimalidade', fontsize=14, fontweight='bold')
+        ax2.set_title('Gap em relação à melhor solução', fontsize=14, fontweight='bold')
     
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nGráfico salvo em: {filename}")
     plt.show()
 
+
 # EXECUÇÃO PRINCIPAL
-def solve_tsp(filepath):
-    nodes, coords, weight_type, explicit_weights, seed = TSPReader.read(filepath)
-    dist_matrix = DistanceCalculator.build_matrix(nodes, coords, weight_type, explicit_weights)
-    idx_map = {n: i for i, n in enumerate(nodes)}
+def solve_tsp(filepath, time_limit=None, seed=None):
+    nodes, coords, weight_type, explicit_weights, file_seed = TSPReader.read(filepath)
+    xy = np.array([coords[n] for n in nodes], dtype=np.float64)
+    # Matriz só se vier no arquivo; senão o núcleo C calcula EUC_2D direto das coordenadas.
+    dist_matrix = explicit_weights
+
+    # seed explícita > seed do arquivo > 0
+    try:
+        rng = random.Random(int(seed if seed is not None else file_seed))
+    except (TypeError, ValueError):
+        rng = random.Random(0)
 
     tracker = ProgressTracker()
-    
-    clusters = Clustering.create_clusters(nodes, coords)
-    logger.info(f"Created {len(clusters)} clusters")
+    solver = Solver(rng, xy, dist_matrix)
+    tour, final_length = solver.solve(time_limit or CONFIG['time_limit'], tracker)
 
-    cluster_tours = []
-    border_nodes = {}
-
-    for cid, cluster in enumerate(clusters):
-        if not cluster:
-            continue
-
-        start, end = Clustering.find_border_nodes(cluster, coords, idx_map)
-        if start is None or start not in idx_map:
-            continue
-
-        border_nodes[cid] = (start, end)
-
-        edges = TourBuilder.dijkstra_tree(cluster, start, dist_matrix, idx_map)
-        tour = TourBuilder.dfs_tour(edges, start, dist_matrix, idx_map)
-
-        if tour and len(tour) >= 2:
-            tour.append(tour[0])
-
-        tour = LocalOptimizer.two_opt(tour, dist_matrix, idx_map, tracker, f"2-opt cluster {cid+1}")
-        if len(tour) >= 2 and tour[-1] != tour[0]:
-            tour.append(tour[0])
-
-        cluster_tours.append(tour)
-
-    if not cluster_tours:
-        logger.warning("No valid tours created")
-        tour = list(nodes) + [nodes[0]] if nodes else []
-        cluster_tours = [tour]
-
-    logger.info(f"Starting merge with {len(cluster_tours)} tours")
-
-    # Merge de clusters
-    current_tours = [t for t in cluster_tours if t and len(t) >= 2]
-    tour_indices = list(range(len(current_tours)))
-    iteration = 1
-
-    while len(current_tours) > 1:
-        logger.info(f"Merge iteration {iteration}, {len(current_tours)} tours remaining")
-
-        min_dist = CONFIG['infinity']
-        pair = (0, 1)
-
-        for i in range(len(current_tours)):
-            for j in range(i+1, len(current_tours)):
-                ti, tj = tour_indices[i], tour_indices[j]
-                if ti not in border_nodes or tj not in border_nodes:
-                    continue
-
-                u = border_nodes[ti][1]
-                v = border_nodes[tj][0]
-                if u in idx_map and v in idx_map:
-                    d = dist_matrix[idx_map[u]][idx_map[v]]
-                    if d < min_dist:
-                        min_dist = d
-                        pair = (i, j)
-
-        i, j = pair
-        ti, tj = tour_indices[i], tour_indices[j]
-        logger.info(f"Merging clusters {ti} and {tj}")
-
-        tour1, tour2 = current_tours[i], current_tours[j]
-        merged_tour = TourUtils.merge_tours(tour1, tour2, dist_matrix, idx_map)
-        merged_tour = TourUtils.remove_subtours(merged_tour, dist_matrix, idx_map, coords)
-
-        merged_tour = LocalOptimizer.two_opt(merged_tour, dist_matrix, idx_map, tracker, f"2-opt iter {iteration}")
-        if len(merged_tour) >= 2 and merged_tour[-1] != merged_tour[0]:
-            merged_tour.append(merged_tour[0])
-
-        combined_nodes = list(set(tour1[:-1] + tour2[:-1]))
-        if combined_nodes:
-            start_node, end_node = Clustering.find_border_nodes(combined_nodes, coords, idx_map)
-            if start_node and end_node:
-                new_index = len(current_tours)
-                border_nodes[new_index] = (start_node, end_node)
-
-        current_tours.append(merged_tour)
-        current_tours.pop(max(i, j))
-        current_tours.pop(min(i, j))
-        tour_indices = list(range(len(current_tours)))
-
-        iteration += 1
-
-    combined_tour = current_tours[0] if current_tours else []
-    
-    # Otimização final
-    tour = LocalOptimizer.two_opt(combined_tour, dist_matrix, idx_map, tracker, "2-opt final")
-    original_len = TourBuilder.calculate_length(tour, dist_matrix, idx_map)
-
-    logger.info("Applying multiple perturbations...")
-    tour = Perturbation.apply_multiple(tour, dist_matrix, idx_map, coords, tracker,
-                                     CONFIG['perturbation']['count'])
-
-    # Rodadas de otimização
-    best_tour = tour
-    for round_num in range(1, CONFIG['optimization_rounds'] + 1):
-        logger.info(f"=== Optimization Round {round_num}/{CONFIG['optimization_rounds']} ===")
-
-        best_tour = ThreeOpt.optimize(best_tour, dist_matrix, idx_map, tracker, f"3-opt round {round_num}")
-        best_tour = LocalOptimizer.tabu_search(best_tour, dist_matrix, idx_map, tracker, f"tabu round {round_num}")
-
-        if CONFIG['perturbation']['between_rounds'] and round_num < CONFIG['optimization_rounds']:
-            logger.info(f"Perturbations between rounds {round_num}...")
-            best_tour = Perturbation.apply_multiple(best_tour, dist_matrix, idx_map, coords, tracker,
-                                                  CONFIG['perturbation']['rounds_count'])
-
-    best_tour = TourUtils.remove_subtours(best_tour, dist_matrix, idx_map, coords)
-    final_length = TourBuilder.calculate_length(best_tour, dist_matrix, idx_map)
-
-    if final_length == CONFIG['infinity']:
-        logger.error("Final tour has infinite length")
-        final_length = 0
+    # Converte índices de volta para rótulos e fecha o ciclo
+    best_tour = [nodes[i] for i in tour]
+    best_tour.append(best_tour[0])
 
     print(f"\n{'='*60}")
     print(f"FINAL LENGTH: {int(final_length)}")
     print(f"{'='*60}")
 
-    return best_tour, final_length, nodes, coords, dist_matrix, tracker, seed
+    return best_tour, final_length, nodes, coords, dist_matrix, tracker, file_seed
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Uso: python script.py instancia.txt")
+    if len(sys.argv) not in (2, 3):
+        print("Uso: python tsp.py instancia.txt [tempo_ils_segundos]")
         sys.exit(1)
 
-    mp.freeze_support()
     start = time.time()
     
-    best_tour, final_length, nodes, coords, dist_matrix, tracker, seed = solve_tsp(sys.argv[1])
+    best_tour, final_length, nodes, coords, dist_matrix, tracker, seed = solve_tsp(sys.argv[1], float(sys.argv[2]) if len(sys.argv) == 3 else None)
     
     elapsed = time.time() - start
     minutes, seconds = divmod(int(elapsed), 60)
@@ -926,15 +648,6 @@ if __name__ == "__main__":
                     x, y = coords[n]
                     f.write(f"{n}: {x:.4f}, {y:.4f}\n")
             
-            f.write("\n\n")
-            
-            f.write("Matriz de Distâncias:\n")
-            for i in range(len(nodes)):
-                linha_str = []
-                for j in range(len(nodes)):
-                    linha_str.append(str(dist_matrix[i][j]))
-                f.write("   " + "   ".join(linha_str) + "\n")
-                
             f.write("\n\n")
             
             f.write("MELHOR SOLUÇÃO ENCONTRADA\n")
