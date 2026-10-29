@@ -1,5 +1,14 @@
 # Caixeiro Viajante
 
+Solver heurístico de TSP em Python com núcleo em C: **Lin-Kernighan + alpha-nearness + ILS paralelo**.
+
+- **Ótimo em 4 de 4 seeds** em 10 instâncias TSPLIB de 51 a 1002 nós (30 s no máximo).
+- **0,09% de gap** médio em pr2392 (2392 nós, clusterizada).
+- **200 mil nós em 67 s**, 314 MB de memória (O(n), sem matriz de distâncias).
+
+![pr1002: tour ótimo (259045) e convergência](./docs/pr1002.png)
+*pr1002 (TSPLIB), 15 s, 8 núcleos: comprimento 259045, igual ao ótimo conhecido.*
+
 ## Descrição
 Solução para o Problema do Caixeiro Viajante (TSP - Traveling Salesman Problem), um dos problemas clássicos de otimização computacional.
 
@@ -34,9 +43,6 @@ python test_tsp.py
 python benchmark.py [tempo_s] [n_seeds] [instancias...]   # várias seeds em paralelo
 ```
 Aceita o formato próprio (`gerador_tsp.py`) e arquivos TSPLIB `EUC_2D` (`tsplib/`). Gera `<instancia>_solucao.txt` e `<instancia>_grafico.png`.
-
-## Exemplo de Saída
-![Visualização da rota TSP](./300_tsp_grafico.png)
 
 ## Estrutura
 ```
@@ -84,8 +90,6 @@ Uma medição anterior de pr2392 deu 0,01% com a versão que usava matriz densa.
 Evolução (pr2392, média): Python 2-opt + Or-opt 1,15%; núcleo C com 10 vizinhos 0,12%; versão atual 0,08%. Versão original do projeto (clusters + Dijkstra + 3-opt + tabu): 200_tsp = 1052 em 11 s e 500_tsp = 1716 em 94 s.
 
 Testado e descartado: Or-opt dentro do LK (pr1002 0,21% vs 0,15% e pr2392 0,31% vs 0,28% sem ele, 16 seeds).
-
-O gráfico de gap é relativo à melhor solução da própria execução, não ao ótimo.
 
 ## Licença
 
