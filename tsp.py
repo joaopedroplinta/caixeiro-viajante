@@ -80,20 +80,6 @@ class ProgressTracker:
             'best': self.best_length,
             'stage': stage
         })
-        
-    def get_gap_history(self, optimal_length):
-        # Calcula histórico de gap de otimalidade em relação ao ótimo. 
-        if not self.history or optimal_length is None or optimal_length == 0:
-            return []
-        
-        gaps = []
-        for entry in self.history:
-            gap = ((entry['best'] - optimal_length) / optimal_length) * 100
-            gaps.append({
-                'iteration': entry['iteration'],
-                'gap': max(0.1, gap)
-            })
-        return gaps
 
 # PARSER TSPLIB
 # Utilitário para ler arquivos de instâncias TSP.
@@ -544,7 +530,7 @@ class Solver:
 
 # VISUALIZAÇÃO
 # Plota o tour e o gráfico de convergência.
-def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_result.png"):
+def plot_final_result(tour, coords, final_length, history, filename="tsp_result.png"):
     fig = plt.figure(figsize=(16, 7))
     
     # Gráfico 1: Rota do TSP
@@ -562,29 +548,17 @@ def plot_final_result(tour, coords, final_length, gap_history, filename="tsp_res
     ax1.grid(True, alpha=0.3)
     ax1.set_aspect('equal')
     
-    # Gráfico 2: Gap de Otimalidade
+    # Gráfico 2: comprimento do melhor tour a cada rodada
     ax2 = plt.subplot(1, 2, 2)
-    
-    if gap_history:
-        iterations = [entry['iteration'] for entry in gap_history]
-        gaps = [entry['gap'] for entry in gap_history]
-        
-        ax2.plot(iterations, gaps, 'g-', linewidth=2, label='Gap')
-        ax2.axhline(y=1.0, color='r', linestyle='--', linewidth=1, alpha=0.7, label='1% Gap')
-        ax2.axhline(y=0.1, color='orange', linestyle='--', linewidth=1, alpha=0.7, label='0.1% Gap')
-        
-        final_gap = gaps[-1]
-        ax2.set_yscale('log')
-        ax2.set_title(f'Gap em relação à melhor solução (Final: {final_gap:.2f}%)', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Iteração', fontsize=12)
-        ax2.set_ylabel('Gap (%)', fontsize=12)
-        ax2.legend(loc='upper right')
-        ax2.grid(True, alpha=0.3, which='both')
+    if history:
+        ax2.plot([h['iteration'] for h in history], [h['best'] for h in history], 'g-o', linewidth=2, markersize=4)
+        ax2.set_title(f'Melhor comprimento por rodada (final: {history[-1]["best"]:.0f})', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Rodada', fontsize=12)
+        ax2.set_ylabel('Comprimento do tour', fontsize=12)
+        ax2.grid(True, alpha=0.3)
     else:
-        ax2.text(0.5, 0.5, 'Sem histórico de gap disponível', 
-                ha='center', va='center', transform=ax2.transAxes, fontsize=12)
-        ax2.set_title('Gap em relação à melhor solução', fontsize=14, fontweight='bold')
-    
+        ax2.text(0.5, 0.5, 'Sem histórico disponível', ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"\nGráfico salvo em: {filename}")
@@ -667,6 +641,5 @@ if __name__ == "__main__":
         print(f"\nErro ao gerar arquivo de saída: {e}")
 
     # Gera visualização
-    gap_history = tracker.get_gap_history(final_length)
     plot_filename = base_name + "_grafico.png"
-    plot_final_result(best_tour, coords, final_length, gap_history, plot_filename)
+    plot_final_result(best_tour, coords, final_length, tracker.history, plot_filename)
